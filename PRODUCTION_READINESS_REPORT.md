@@ -2,7 +2,8 @@
 ## Greece Sky and Weather Nowcast — `nowcast_ml` add-on
 
 **Repository:** `Iakovosv/Greece-Sky-and-Weather-Nowcast_5`
-**Commit under test:** `ad360c0` (baseline `1.0.0`)
+**Baseline under test:** commit `ad360c0` (release `1.0.0`)
+**Delivered as:** branch `production-hardening`, release `1.1.0`
 **Test date:** 2026-09-18
 **Method:** every result below was produced through the **real add-on entry point**
 (`python3 main.py` → `core/loop.py:run()`), driven against a fake Ecowitt HTTP
@@ -242,11 +243,14 @@ yet stored, `infer()` returned only PoP/quantile keys, so a consumer parsing
 `lead_min` would `KeyError` until the first sample. The no-reading branch now
 returns the full 23-key schema.
 
-**Finding 4.3 (action needed, not patched) — MQTT command acknowledgement is not
-confirmed.** The `station_model.json` file **is** written when a `save` command is
-published, so the feature works, but the add-on never publishes an
-acknowledgement. The HA button therefore gives the user no feedback. Recommend
-publishing to `{base_state}/command_result`. Low severity, low effort.
+**Finding 4.3 (fixed) — MQTT command acknowledgement.** The `station_model.json`
+file **was** written when a `save` command was published, so the feature worked,
+but the add-on never published an acknowledgement, so the HA button gave the user
+no feedback and a failed save was indistinguishable from a successful one. The
+add-on now publishes to `{base_state}/command_result` with
+`{"command","ok","detail","ts"}`, including the error text when a save fails.
+Verified end-to-end against a live broker: publishing `save` produced
+`{"command": "save", "ok": true, "detail": "station model state saved", ...}`.
 
 **Finding 4.4 (minor) — discovery `retain` flag.** Discovery messages are
 published with `retain=True`, which is correct; the probe's own assertion
@@ -429,10 +433,11 @@ All patches are applied on branch `production-hardening` and exported as
 | # | Item | Effort |
 |---|---|---|
 | R1 | **Change licence from CC BY-NC-ND to MIT/Apache-2.0** | 1 min — **blocking** |
-| R2 | Publish a command acknowledgement topic | small |
-| R3 | Add Docker build/run section to README | small |
-| R4 | Update `FIX_NOTES.md`: 15–20 min honest lead, list new files | small |
-| R5 | Consider shadow-mode flag to run without publishing alerts | medium |
+| R2 | Consider shadow-mode flag to run without publishing alerts | medium |
+
+R2 (command acknowledgement), R3 (Docker docs) and R4 (FIX_NOTES corrections)
+from the original draft of this list are now **shipped** — see sections 5.1, 6.1
+and the addendum in `FIX_NOTES.md`.
 
 ### Applying the patch
 
@@ -479,7 +484,8 @@ git apply /path/to/patches/production-hardening.patch
 
 ### Pillar 5 — Docs / open-source
 - [x] README install + MQTT instructions — **Pass**
-- [ ] Docker instructions — **Action needed**
+- [x] Docker instructions — **Fixed + Pass**
+- [x] MQTT option table + env-var overrides documented — **Fixed + Pass**
 - [x] 360m trend-only limitation stated honestly — **Pass**
 - [x] Logging clean, no spam — **Pass**
 - [x] Understandable disconnect messages — **Fixed + Pass**
@@ -501,5 +507,27 @@ contract (lead time, alert flags) did not exist**.
 
 One item is genuinely blocking and is not a code fix: the **CC BY-NC-ND licence**
 conflicts with distributing this on the HA Community Store and with shipping
-these patches as a derivative work. Resolve that, add Docker docs, publish a
-small command ack, and the add-on is ready to share.
+these patches as a derivative work. The other two items from the draft of this
+list — Docker docs and the command acknowledgement — are now shipped.
+
+---
+
+## 13. Final verification of the released artifact
+
+After all fixes, the release was re-tested from the **published tree itself**
+(the `nowcast_ml/rootfs/app` directory of this release, not the working copy), so
+the numbers below describe the artifact that ships.
+
+| Gate | Result |
+|---|---|
+| Lead time on the `FIX_NOTES.md` timeline | **16 min / 15 min** |
+| Precision @60m, threshold 50% | **1.00** |
+| F1 @60m | **0.353** |
+| False alarms in the quiet window (700–1140) | **0 / 440** |
+| Spike scenario: any alert before minute 780 | **0** |
+| Compile check (`compileall`) | **Pass** |
+| Patch applies to `ad360c0` with `git apply --check` | **Pass** |
+| Patched tree compiles | **Pass** |
+| MQTT command ack, live broker, end-to-end | **Pass** |
+
+**Verdict:** the code is ready to share. The licence is the only open item.
