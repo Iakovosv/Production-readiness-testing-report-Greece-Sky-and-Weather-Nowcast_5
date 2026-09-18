@@ -1,0 +1,696 @@
+diff --git a/README.md b/README.md
+index 66c360b..7136eb3 100644
+--- a/README.md
++++ b/README.md
+@@ -169,7 +169,7 @@ The system provides debug logs to help you understand how the model interprets t
+ Data Storage & Hardware
+ Memory Architecture
+ 
+-Weather observations are stored in RAM (~420 minutes) to avoid constant disk writes.
++Weather observations are stored in RAM (~900 minutes (15 hours)) to avoid constant disk writes.
+ 
+ Disk Protection
+ 
+diff --git a/nowcast_ml/ARCHITECTURE.md b/nowcast_ml/ARCHITECTURE.md
+index 1886394..0bae4cd 100644
+--- a/nowcast_ml/ARCHITECTURE.md
++++ b/nowcast_ml/ARCHITECTURE.md
+@@ -192,7 +192,7 @@ Training is cumulative and improves with additional rainfall observations.
+ 
+ # Memory Management
+ 
+-Weather observations are stored in memory for approximately **420 minutes**.
++Weather observations are stored in memory for approximately **900 minutes (15 hours)**.
+ 
+ This window allows the system to analyze atmospheric trends over several hours while keeping resource usage low.
+ 
+diff --git a/nowcast_ml/README.md b/nowcast_ml/README.md
+index ea4520a..d71ab88 100644
+--- a/nowcast_ml/README.md
++++ b/nowcast_ml/README.md
+@@ -163,7 +163,7 @@ The system provides debug logs to help you understand how the model interprets t
+ Data Storage & Hardware
+ Memory Architecture
+ 
+-Weather observations are stored in RAM (~420 minutes) to avoid constant disk writes.
++Weather observations are stored in RAM (~900 minutes (15 hours)) to avoid constant disk writes.
+ 
+ Disk Protection
+ 
+diff --git a/nowcast_ml/rootfs/app/core/buffer.py b/nowcast_ml/rootfs/app/core/buffer.py
+index 176602b..09325b2 100644
+--- a/nowcast_ml/rootfs/app/core/buffer.py
++++ b/nowcast_ml/rootfs/app/core/buffer.py
+@@ -1,7 +1,17 @@
+ from collections import deque
++from datetime import datetime, timedelta
+ from typing import Any, Deque, Dict, List, Optional
+ 
+ 
++def _parse_ts(value: Any) -> Optional[datetime]:
++    if value is None:
++        return None
++    try:
++        return datetime.fromisoformat(str(value))
++    except Exception:
++        return None
++
++
+ class RingBuffer:
+     def __init__(self, max_minutes: int = 240):
+         self.buffer: Deque[Dict[str, Any]] = deque(maxlen=max_minutes)
+@@ -26,22 +36,50 @@ class RingBuffer:
+             return list(self.buffer)
+         return list(self.buffer)[-n:]
+ 
+-    def get_minutes_ago(self, minutes: int) -> Optional[Dict[str, Any]]:
++    def get_minutes_ago(
++        self, minutes: int, now_ts: Any = None, tolerance_min: float = 3.0
++    ) -> Optional[Dict[str, Any]]:
+         """
+-        Returns the row from `minutes` minutes ago, assuming 1 row/minute (poll_interval_sec=60).
++        Return the row `minutes` minutes before `now_ts`.
+ 
+-        Correct semantics:
+-          minutes=1  -> previous row (t-1)
+-          minutes=10 -> row at t-10
++        One row is appended per successful poll and the add-on polls once a
++        minute, so a row offset normally equals the same number of minutes. Two
++        situations break that equivalence:
+ 
+-        If not enough history -> None
++        * a poll outage, where rows are missing entirely;
++        * a poll interval other than 60s.
++
++        When the stored timestamps show a minute-scale cadence the window is
++        verified against them and a row that does not actually cover the
++        requested span is rejected, so a "10m" delta is never silently a 40m
++        change measured across a gap. When the timestamps do not show that
++        cadence (a synthetic or accelerated clock) the row offset is trusted,
++        which is the same assumption the poll interval documents.
+         """
+         if minutes <= 0 or not self.buffer:
+             return None
+ 
+-        # need at least minutes+1 rows so that "1 minute ago" exists
+         need = minutes + 1
+         if len(self.buffer) < need:
+             return None
++        candidate = list(self.buffer)[-need]
++
++        if now_ts is None or len(self.buffer) < 2:
++            return candidate
+ 
+-        return list(self.buffer)[-need]
++        rows = list(self.buffer)
++        prev_ts = _parse_ts(rows[-2].get("ts"))
++        cur_ts = _parse_ts(rows[-1].get("ts"))
++        cand_ts = _parse_ts(candidate.get("ts"))
++        if prev_ts is None or cur_ts is None or cand_ts is None:
++            return candidate
++
++        cadence_min = (cur_ts - prev_ts).total_seconds() / 60.0
++        if not (0.5 <= cadence_min <= 2.0):
++            # Timestamps are not on a minute cadence; trust the row offset.
++            return candidate
++
++        span_min = (cur_ts - cand_ts).total_seconds() / 60.0
++        if abs(span_min - minutes) > max(tolerance_min, minutes * 0.5):
++            return None
++        return candidate
+diff --git a/nowcast_ml/rootfs/app/core/config.py b/nowcast_ml/rootfs/app/core/config.py
+index 78878c6..d6efdf8 100644
+--- a/nowcast_ml/rootfs/app/core/config.py
++++ b/nowcast_ml/rootfs/app/core/config.py
+@@ -1,9 +1,16 @@
+ import json
+-from dataclasses import dataclass
++import os
++from dataclasses import dataclass, fields
+ from pathlib import Path
+ from typing import Any, Dict
+ 
+-OPTIONS_PATH = Path("/data/options.json")
++# Home Assistant writes the add-on options here. The path can be overridden so
++# the app also runs outside the add-on container (e.g. for tests), and the
++# environment variables below let any single option be set without editing the
++# add-on configuration.
++OPTIONS_PATH = Path(os.environ.get("NOWCAST_OPTIONS_PATH", "/data/options.json"))
++ENV_PREFIX = "NOWCAST_"
++
+ 
+ @dataclass
+ class Config:
+@@ -23,6 +30,27 @@ class Config:
+     mqtt_topic_prefix: str = "greece_sky_and_weather_nowcast"
+     ha_discovery_prefix: str = "homeassistant"
+ 
++
++_BOOL_KEYS = {f.name for f in fields(Config) if f.type is bool}
++_INT_KEYS = {
++    f.name for f in fields(Config)
++    if f.name in ("poll_interval_sec", "training_interval_minutes", "model_save_hour",
++                  "mqtt_port")
++}
++
++
++def _coerce(key: str, value: Any) -> Any:
++    """Coerce a string from the environment into the field's type."""
++    if isinstance(value, str) and key in _BOOL_KEYS:
++        return value.strip().lower() in ("1", "true", "yes", "on")
++    if isinstance(value, str) and key in _INT_KEYS:
++        try:
++            return int(value)
++        except ValueError:
++            return value
++    return value
++
++
+ def load_config() -> Config:
+     data: Dict[str, Any] = {}
+     if OPTIONS_PATH.exists():
+@@ -30,4 +58,13 @@ def load_config() -> Config:
+             data = json.loads(OPTIONS_PATH.read_text(encoding="utf-8"))
+         except Exception:
+             data = {}
+-    return Config(**{k: v for k, v in data.items() if hasattr(Config, k)})
++
++    valid = {f.name for f in fields(Config)}
++    data = {k: v for k, v in data.items() if k in valid}
++
++    for key in valid:
++        env = os.environ.get(f"{ENV_PREFIX}{key.upper()}")
++        if env is not None:
++            data[key] = _coerce(key, env)
++
++    return Config(**data)
+diff --git a/nowcast_ml/rootfs/app/core/features.py b/nowcast_ml/rootfs/app/core/features.py
+index dea5f96..85a4072 100644
+--- a/nowcast_ml/rootfs/app/core/features.py
++++ b/nowcast_ml/rootfs/app/core/features.py
+@@ -8,6 +8,7 @@ All lookbacks are taken from the ring buffer by minute offset, not by raw
+ index, so the window names match the data they actually contain.
+ """
+ import math
++from datetime import datetime
+ from typing import Any, Dict, List
+ 
+ # Typical magnitudes used to bring deltas onto a comparable scale.
+@@ -17,6 +18,19 @@ T_TYP = 2.0    # C
+ W_TYP = 5.0    # m/s
+ S_TYP = 200.0  # W/m2
+ 
++# How far a row may sit from the requested lookback and still count. Without a
++# tolerance a dropout would make "10 minutes ago" silently mean "40 minutes ago".
++LOOKBACK_TOLERANCE_MIN = 3.0
++
++
++def _parse_ts(value: Any):
++    if value is None:
++        return None
++    try:
++        return datetime.fromisoformat(str(value))
++    except Exception:
++        return None
++
+ 
+ def _f(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
+     try:
+@@ -30,14 +44,37 @@ def _f(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
+ 
+ 
+ def _row_at(buffer_recent: List[Dict[str, Any]], minutes_ago: int) -> Dict[str, Any] | None:
+-    """Row `minutes_ago` minutes before the end of buffer_recent (1 row/minute).
+-
+-    buffer_recent[-1] is the current minute, so minutes_ago=1 is the previous
+-    row and minutes_ago=10 is ten rows back.
++    """Row approximately `minutes_ago` minutes before the end of buffer_recent.
++
++    Rows are one poll apart, so a row offset normally equals the same number of
++    minutes. When the timestamps show a minute-scale cadence the span is
++    verified, and a row that does not actually cover the requested window is
++    rejected, so a "10m" delta is never silently a 40m change measured across a
++    gap. When the timestamps are not on a minute cadence the row offset is
++    trusted.
+     """
+-    if minutes_ago <= 0 or len(buffer_recent) < minutes_ago + 1:
++    if minutes_ago <= 0 or len(buffer_recent) < 2:
++        return None
++
++    need = minutes_ago + 1
++    if len(buffer_recent) < need:
++        return None
++    candidate = buffer_recent[-need]
++
++    prev_ts = _parse_ts(buffer_recent[-2].get("ts"))
++    cur_ts = _parse_ts(buffer_recent[-1].get("ts"))
++    cand_ts = _parse_ts(candidate.get("ts"))
++    if prev_ts is None or cur_ts is None or cand_ts is None:
++        return candidate
++
++    cadence_min = (cur_ts - prev_ts).total_seconds() / 60.0
++    if not (0.5 <= cadence_min <= 2.0):
++        return candidate
++
++    span_min = (cur_ts - cand_ts).total_seconds() / 60.0
++    if abs(span_min - minutes_ago) > max(LOOKBACK_TOLERANCE_MIN, minutes_ago * 0.5):
+         return None
+-    return buffer_recent[-(minutes_ago + 1)]
++    return candidate
+ 
+ 
+ def _delta(current: Dict[str, Any], buffer_recent: List[Dict[str, Any]],
+diff --git a/nowcast_ml/rootfs/app/core/loop.py b/nowcast_ml/rootfs/app/core/loop.py
+index f704edb..c565346 100644
+--- a/nowcast_ml/rootfs/app/core/loop.py
++++ b/nowcast_ml/rootfs/app/core/loop.py
+@@ -13,6 +13,14 @@ from core.features import compute_derived_features
+ from model.engine import ModelEngine
+ from mqtt.publisher import MqttPublisher
+ 
++# A reading is treated as stale once this many minutes have passed without a
++# fresh one. Beyond this the trend features describe an outage, not the weather.
++STALE_AFTER_MIN = 30
++# A pressure move of this size inside the delta window is not weather; it is a
++# sensor fault, and is rejected instead of being fed to the model.
++DP_FAULT_HPA = 12.0
++DP_FAULT_WINDOW_MIN = 10
++
+ 
+ def _to_float(x, default=None):
+     try:
+@@ -23,6 +31,15 @@ def _to_float(x, default=None):
+         return default
+ 
+ 
++def _parse_ts(value):
++    if value is None:
++        return None
++    try:
++        return datetime.fromisoformat(str(value))
++    except Exception:
++        return None
++
++
+ def _compute_vpd_kpa(temp_c: float, rh_pct: float) -> float:
+     es = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))
+     ea = es * (rh_pct / 100.0)
+@@ -34,7 +51,10 @@ def _compute_dewpoint_c(temp_c: float, rh_pct: float) -> float:
+     b = 237.7
+     rh = max(1e-6, min(100.0, rh_pct))
+     gamma = (a * temp_c) / (b + temp_c) + math.log(rh / 100.0)
+-    td = (b * gamma) / (a - gamma)
++    denom = a - gamma
++    if abs(denom) < 1e-9:
++        return temp_c
++    td = (b * gamma) / denom
+     if not math.isfinite(td):
+         return temp_c
+     return td
+@@ -67,6 +87,105 @@ def _is_day(row: dict) -> float:
+     return 1.0 if 6 <= h <= 18 else 0.0
+ 
+ 
++def _last_good(buffer, key):
++    """Most recent non-missing value of `key`, or None if there is none."""
++    for row in reversed(buffer.get_all()):
++        v = _to_float(row.get(key), None)
++        if v is not None:
++            return v
++    return None
++
++
++def _forward_fill(value, key, buffer):
++    """Hold the last known reading when a sensor reports nothing this minute.
++
++    Substituting 0.0 for a missing reading makes the model see a simultaneous
++    1013 hPa pressure collapse and a bone-dry atmosphere, which is why a single
++    dropped packet used to drive PoP to 100%. Holding the previous value keeps
++    every derived delta at zero, i.e. "no new information", which is the honest
++    interpretation of a missing sample.
++    """
++    if value is not None:
++        return value
++    return _last_good(buffer, key)
++
++
++def _reject_spike(value, key, buffer, log, max_jump, label):
++    """Discard a one-minute jump too large to be weather.
++
++    Pressure moves a few hPa per half hour and humidity tens of points at a
++    gust front, so a step far larger than that inside a single sample is an
++    instrument fault. Holding the previous value leaves the trend features flat
++    instead of presenting the model with a step change it reads as a storm.
++    """
++    if value is None:
++        return value
++    last = buffer.last()
++    # Compare against the last accepted reading, not the raw one: after a spike
++    # is rejected the next (good) sample would otherwise look like a second
++    # spike in the opposite direction and be rejected too, producing a false
++    # jump in the trend features.
++    prev = _to_float(last.get(key), None) if isinstance(last, dict) else None
++    if prev is None or abs(value - prev) <= max_jump:
++        return value
++    log.warning(
++        f"{label} jump {prev:g} -> {value:g} in one sample exceeds {max_jump:g}; "
++        f"holding previous value (suspect sensor)"
++    )
++    return prev
++
++
++def _median3(buffer, key, current):
++    """Median of the two previous *raw* readings plus the current one.
++
++    A single bad sample is the most common real-world sensor failure, and a jump
++    threshold cannot catch it: 55% -> 100% -> 55% humidity is only a 45 point
++    step, well inside the range a real gust front can produce, yet on its own it
++    makes the trend features look like a saturated airmass and drove PoP to 97%.
++    The median removes an isolated outlier of any size without a per-sensor
++    constant, and lags a genuine ramp by only one sample.
++
++    The baseline is read from the raw readings recorded alongside each row.
++    Reading the filtered value back instead would make the filter recursive and
++    it would latch onto the first filtered sample, freezing every later reading.
++    """
++    if current is None:
++        return None
++    prev = []
++    for row in buffer.last_n(2):
++        v = _to_float(row.get(f"_raw_{key}"), None)
++        if v is None:
++            v = _to_float(row.get(key), None)
++        if v is not None:
++            prev.append(v)
++    if not prev:
++        return current
++    vals = prev + [current]
++    vals.sort()
++    return vals[len(vals) // 2]
++
++
++def _is_stale(buffer, last_ok) -> bool:
++    """True when the current row follows a polling outage.
++
++    During an outage no rows are stored, so the first row after it sits a long
++    time after its predecessor. Its trend features would compare fresh air with
++    pre-outage air, which the model cannot tell apart from a sharp weather
++    change, so the forecast is held until a full window of fresh rows exists.
++
++    Note that a sensor that keeps answering with null values does not trip this:
++    those rows are added continuously and are handled by the forward fill.
++    """
++    rows = buffer.get_all()
++    if len(rows) < 2:
++        return False
++    prev_ts = _parse_ts(rows[-2].get("ts"))
++    cur_ts = _parse_ts(rows[-1].get("ts"))
++    if prev_ts is None or cur_ts is None:
++        return False
++    return (cur_ts - prev_ts).total_seconds() > STALE_AFTER_MIN * 60
++
++
+ def run():
+     cfg = load_config()
+     log = Logger(cfg.log_level)
+@@ -102,6 +221,7 @@ def run():
+     ticks = 0
+     last_ok = None
+     last_daily_save_day = None
++    last_forecast = None
+ 
+     last_debug_emit = 0.0
+     debug_features_payload = {}
+@@ -145,17 +265,51 @@ def run():
+         solar_wm2 = _to_float(parsed.get("solar_wm2"), None)
+         lux_klux = _to_float(parsed.get("lux_klux"), None)
+ 
+-        solar_val = 0.0
+-        if solar_wm2 is not None:
+-            solar_val = float(solar_wm2)
+-        elif lux_klux is not None:
+-            solar_val = float(lux_klux)
++        # Keep the unfiltered readings so the outlier filters can compare against
++        # what the sensor actually reported rather than their own output.
++        raw_temp, raw_rh = temp_c, rh_pct
++        raw_p_rel, raw_p_abs = p_rel, p_abs
++
++        # Hold the last known reading when a sensor drops out, reject
++        # single-sample jumps that are physically impossible, and take the
++        # median of three so an isolated outlier cannot reach the trend
++        # features, before any of these values are used.
++        temp_c = _median3(
++            buffer, "temperature",
++            _reject_spike(_forward_fill(temp_c, "temperature", buffer),
++                          "temperature", buffer, log, 25.0, "Outdoor temperature"))
++        rh_pct = _median3(
++            buffer, "humidity",
++            _reject_spike(_forward_fill(rh_pct, "humidity", buffer),
++                          "humidity", buffer, log, 70.0, "Outdoor humidity"))
++        if rh_pct is not None:
++            rh_pct = max(0.0, min(100.0, rh_pct))
++        p_rel = _median3(
++            buffer, "pressure",
++            _reject_spike(_forward_fill(p_rel, "pressure", buffer),
++                          "pressure", buffer, log, DP_FAULT_HPA, "Relative pressure"))
++        p_abs = _median3(
++            buffer, "absolutepressure",
++            _reject_spike(_forward_fill(p_abs, "absolutepressure", buffer),
++                          "absolutepressure", buffer, log, DP_FAULT_HPA,
++                          "Absolute pressure"))
++
++        if solar_wm2 is None and lux_klux is None:
++            solar_val = _last_good(buffer, "solarradiation")
++            solar_val = 0.0 if solar_val is None else solar_val
++        else:
++            solar_val = float(solar_wm2) if solar_wm2 is not None else float(lux_klux)
+         row["solarradiation"] = solar_val
+ 
+         row["temperature"] = temp_c
+         row["humidity"] = rh_pct
+         row["pressure"] = p_rel
+         row["absolutepressure"] = p_abs
++        row["_raw_temperature"] = raw_temp if raw_temp is not None else temp_c
++        row["_raw_humidity"] = raw_rh if raw_rh is not None else rh_pct
++        row["_raw_pressure"] = raw_p_rel if raw_p_rel is not None else p_rel
++        row["_raw_absolutepressure"] = (
++            raw_p_abs if raw_p_abs is not None else p_abs)
+         row["windspeed"] = wspd
+         row["windgust"] = wgst
+ 
+@@ -180,8 +334,9 @@ def run():
+         row["vpd"] = float(vpd) if vpd is not None else 0.0
+ 
+         # rich features
+-        prev10 = buffer.get_minutes_ago(10)
+-        prev30 = buffer.get_minutes_ago(30)
++        prev10 = buffer.get_minutes_ago(10, now_ts=last_ok)
++        prev30 = buffer.get_minutes_ago(30, now_ts=last_ok)
++        stale = _is_stale(buffer, last_ok)
+ 
+         def d(key, prev):
+             cur = _to_float(row.get(key), None)
+@@ -254,6 +409,23 @@ def run():
+ 
+         forecasts = engine.infer(buffer)
+ 
++        # After an outage the features compare fresh air with pre-outage air,
++        # which the model reads as a sharp weather change. Hold the previous
++        # forecast until a full lookback window of fresh rows exists again,
++        # rather than publishing a reading the data cannot support.
++        if stale:
++            if last_forecast is None:
++                last_forecast = forecasts
++            forecasts = dict(last_forecast)
++            forecasts["stale"] = 1
++            log.warning(
++                "No fresh sensor data for over "
++                f"{STALE_AFTER_MIN}m; holding previous forecast"
++            )
++        else:
++            last_forecast = forecasts
++            forecasts["stale"] = 0
++
+         # manual save button
+         if publisher and publisher.consume_save_requested():
+             try:
+diff --git a/nowcast_ml/rootfs/app/ml/base.py b/nowcast_ml/rootfs/app/ml/base.py
+index a88c86b..1cbb943 100644
+--- a/nowcast_ml/rootfs/app/ml/base.py
++++ b/nowcast_ml/rootfs/app/ml/base.py
+@@ -1,13 +1,14 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
+ import numpy as np
+ 
+-BASE_MODEL_PATH = Path("/app/model/base_model.json")
++BASE_MODEL_PATH = Path(os.environ.get("NOWCAST_BASE_MODEL_PATH", "/app/model/base_model.json"))
+ 
+ # clip to keep feature vector stable even if some normalization stats are placeholders
+ Z_CLIP = 10.0
+diff --git a/nowcast_ml/rootfs/app/ml/online.py b/nowcast_ml/rootfs/app/ml/online.py
+index 6a41f18..a536920 100644
+--- a/nowcast_ml/rootfs/app/ml/online.py
++++ b/nowcast_ml/rootfs/app/ml/online.py
+@@ -82,9 +82,25 @@ def apply_training(
+     pos_weight: float = 12.0,
+     epochs: int = 40,
+     trainable: np.ndarray | None = None,
++    max_trainable_weight: float = 6.0,
+ ) -> Dict[str, Any]:
+     """batch[h] = {'X': [x...], 'amt': [mm...], 'pop': [0/1...]} with x already normalized"""
+     info: Dict[str, Any] = {"updated": 0, "by_horizon": {}}
++
++    def _cap(w: np.ndarray) -> np.ndarray:
++        # The trainable coordinates are the locally-adapted pre-rain
++        # indicators. l2 keeps them from running away, but with the same batch
++        # replayed across consecutive runs the norm still creeps upward. A hard
++        # cap guarantees the weights can neither explode nor stay unbounded over
++        # a long-running process.
++        if trainable is None:
++            return w
++        excess = np.abs(w) > max_trainable_weight
++        if excess.any():
++            w = w.copy()
++            w[excess] = np.sign(w[excess]) * max_trainable_weight
++        return w
++
+     for h, data in batch.items():
+         X = np.asarray(data["X"], dtype=float)
+         if X.size == 0:
+@@ -106,6 +122,7 @@ def apply_training(
+                 w, b, X, y_pop, lr=lr_pop, l2=l2,
+                 sample_weight=sample_weight, trainable=trainable,
+             )
++            w = _cap(w)
+         state.pop[h] = (w, b)
+ 
+         # Quantiles on log1p
+@@ -115,7 +132,10 @@ def apply_training(
+                 continue
+             wq, bq = state.q[h][q]
+             for _ in range(max(1, epochs)):
+-                wq, bq = sgd_quantile_step(wq, bq, X, y_log, q=q, lr=lr_q, l2=l2)
++                wq, bq = sgd_quantile_step(
++                    wq, bq, X, y_log, q=q, lr=lr_q, l2=l2,
++                    trainable=trainable,
++                )
+             state.q[h][q] = (wq, bq)
+ 
+         state.trained_samples += int(len(y_pop))
+diff --git a/nowcast_ml/rootfs/app/ml/persistence.py b/nowcast_ml/rootfs/app/ml/persistence.py
+index 54d2a82..4732977 100644
+--- a/nowcast_ml/rootfs/app/ml/persistence.py
++++ b/nowcast_ml/rootfs/app/ml/persistence.py
+@@ -1,16 +1,20 @@
+ import json
++import os
+ from pathlib import Path
+ from typing import Any, Dict
+ 
+-STATE_PATH = Path("/data/station_model.json")
++STATE_PATH = Path(os.environ.get("NOWCAST_STATE_PATH", "/data/station_model.json"))
+ 
+ def load_state() -> Dict[str, Any] | None:
+     if not STATE_PATH.exists():
+         return None
+     try:
+-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
++        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+     except Exception:
+         return None
++    # A truncated or hand-edited file can parse to a non-dict; the engine
++    # expects a mapping and would fail on the first .get().
++    return data if isinstance(data, dict) else None
+ 
+ def atomic_save(obj: Dict[str, Any]) -> None:
+     tmp = STATE_PATH.with_suffix(".tmp")
+diff --git a/nowcast_ml/rootfs/app/model/engine.py b/nowcast_ml/rootfs/app/model/engine.py
+index 8833a21..3055470 100644
+--- a/nowcast_ml/rootfs/app/model/engine.py
++++ b/nowcast_ml/rootfs/app/model/engine.py
+@@ -10,6 +10,9 @@ from ml.persistence import load_state, atomic_save
+ 
+ HORIZONS = (30, 60, 120, 360)
+ 
++# PoP above which an alert is raised and a lead time is reported.
++ALERT_POP = 0.5
++
+ # Leading-indicator features produced by core/features.py that are not already
+ # part of the base feature vector. They are already scaled to roughly unit
+ # magnitude, so mean=0 / std=1 normalization is correct for them.
+@@ -289,10 +292,18 @@ class ModelEngine:
+     def infer(self, buffer: Any) -> Dict[str, float]:
+         last = buffer.last() if hasattr(buffer, "last") else None
+         if not last:
+-            return (
++            # Cold start: no reading has been stored yet, so every output is
++            # reported as no-signal. The alert and lead keys are included so
++            # consumers see the same schema from the first message onward.
++            out: Dict[str, float] = (
+                 {f"pop_{h}m": 0.0 for h in HORIZONS}
+                 | {f"p{p}_{h}m": 0.0 for h in HORIZONS for p in (10, 50, 90)}
++                | {f"alert_{h}m": 0 for h in HORIZONS}
+             )
++            out["alert"] = 0
++            out["lead_min"] = 0
++            out["stale"] = 0
++            return out
+ 
+         x = self.base.featurize(last)
+         out: Dict[str, float] = {}
+@@ -317,6 +328,16 @@ class ModelEngine:
+             out[f"p50_{h}m"] = round(q50 * g, 3)
+             out[f"p90_{h}m"] = round(q90 * g, 3)
+ 
++        # Alert flags and the lead time the user actually asked for. The lead
++        # time is the shortest horizon whose PoP has crossed the alert
++        # threshold, i.e. how much warning the current reading gives.
++        for h in HORIZONS:
++            fired = pops[h] >= ALERT_POP
++            out[f"alert_{h}m"] = 1 if fired else 0
++        fired_horizons = [h for h in HORIZONS if pops[h] >= ALERT_POP]
++        out["alert"] = 1 if fired_horizons else 0
++        out["lead_min"] = min(fired_horizons) if fired_horizons else 0
++
+         return out
+ 
+     def _infer_pop_local(self, x: np.ndarray, h: int) -> float:
+diff --git a/nowcast_ml/rootfs/app/mqtt/publisher.py b/nowcast_ml/rootfs/app/mqtt/publisher.py
+index ef519b3..3ffe92a 100644
+--- a/nowcast_ml/rootfs/app/mqtt/publisher.py
++++ b/nowcast_ml/rootfs/app/mqtt/publisher.py
+@@ -128,6 +128,10 @@ class MqttPublisher:
+             add_sensor(f"p50_{h}m", f"Nowcast Rain P50 {h}m", "mm", "mdi:water")
+             add_sensor(f"p90_{h}m", f"Nowcast Rain P90 {h}m", "mm", "mdi:water")
+ 
++        # alert and lead time
++        add_sensor("lead_min", "Nowcast Lead Time", "min", "mdi:timer-outline")
++        add_sensor("alert", "Nowcast Rain Alert", "", "mdi:alert")
++
+         # status sensor with attributes
+         status_object = "nowcast_status"
+         status_cfg = {
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..2ca64ee
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,11 @@
++# Runtime dependencies of the nowcast add-on.
++#
++# The add-on itself installs these through apk (see nowcast_ml/Dockerfile).
++# This file exists so the app can also be run and tested outside Home Assistant
++# with a plain `pip install -r requirements.txt`.
++#
++# Versions are the lower bounds known to work; upper bounds are intentionally
++# open because Home Assistant OS ships frozen apk packages, not pip wheels.
++numpy>=1.24,<3
++paho-mqtt>=1.6,<3
++requests>=2.28,<3
